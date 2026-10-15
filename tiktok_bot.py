@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
 """
-tiktok_bot.py  (v3.2)
-Signed TikTok engagement bot optimized for GitHub Actions with proxy support and error handling.
+tiktok_bot.py  (v4.0)
+Signed TikTok engagement bot for GitHub Actions.
+
+v4.0 changes over v3.2:
+  * Host PROBE at startup - only live endpoints (non-empty body) are used.
+  * Proxy PROBE at startup - only proxies that actually answer TikTok are used.
+    Falls back to direct entries when the live pool is too small.
+  * Signing delegated to signer_client (in-process SignerPy, no localhost service).
+  * send_once handles SSLError / ProxyError explicitly and uses verify=False
+    (free proxies frequently present bad certs).
+  * Debug prints full hostnames (no truncation).
+  * Live proxy subset saved to good-proxies.txt for inspection.
 """
 from __future__ import annotations
 
@@ -18,6 +28,11 @@ from typing import Optional
 from urllib.parse import urlencode
 
 import requests
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+import health                                   # NEW: host/proxy probing
+from signer_client import signer                # NEW: in-process signer
 
 from config import (
     CAMPAIGNS_FILE, STATE_FILE, WORKING_PROXY, GEO_FILE,
@@ -26,13 +41,7 @@ from config import (
 )
 from check_proxies import load_lines, parse_proxy
 
-# --- Signing setup --------------------------------------------------------
-try:
-    from SignerPy import sign as sp_sign
-    HAVE_SIGNER = True
-except Exception:
-    HAVE_SIGNER = False
-
+# --- candidate hosts -------------------------------------------------------
 try:
     from SignerPy.hosts import host as sp_hosts
     HOSTS = [f"https://{h}" for h in sp_hosts()]
@@ -43,13 +52,15 @@ except Exception:
         "https://api19-core-useast5.us.tiktokv.com",
         "https://api16-normal-c-alisg.tiktokv.com",
         "https://api16-normal-no1a.tiktokv.eu",
+        "https://api21-normal.tiktokv.com",
+        "https://api16-normal-c-useast2a.tiktokv.com",
     ]
 
 STATS_PATH = "/aweme/v1/aweme/stats/"
 MIN_BODY = 4
 DUTY = 0.65
 
-_SIGN_MODE: Optional[str] = None
+GOOD_PROXY_FILE = Path(__file__).resolve().parent / "good-proxies.txt"
 
 
 # ---------------------------------------------------------------------------
@@ -73,14 +84,13 @@ class Campaign:
 
 def load_campaigns(path: Path) -> list[Campaign]:
     if not path.exists():
-        # Fallback default campaign if campaigns.json doesn't exist yet
         return [Campaign(name="Default Campaign", cap_views=10000, url="", enabled=True)]
-    
+
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
     except Exception:
         raw = []
-        
+
     if isinstance(raw, dict):
         raw = raw.get("campaigns", [])
     out = []
@@ -175,35 +185,32 @@ def make_params(item_id: str, like_rate: float, share_rate: float) -> dict:
     }
 
 
-def _sign(params: dict, qs: str) -> dict:
-    global _SIGN_MODE
-    if not HAVE_SIGNER:
-        return {}
-    for mode, arg in (("str", qs), ("dict", params)):
-        if _SIGN_MODE and mode != _SIGN_MODE:
-            continue
-        try:
-            sig = sp_sign(params=arg, payload=None, version=8404)
-            _SIGN_MODE = mode
-            return {k: v for k, v in sig.items() if isinstance(v, str)}
-        except Exception:
-            continue
-    return {}
-
-
+# ---------------------------------------------------------------------------
 def send_once(host: str, params: dict, proxy, force_sign: bool = True):
+    """Returns (kind, detail). kind in {ok, softblock, hardblock, err}."""
     qs = urlencode(params)
     headers = {
         "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
         "user-agent": random.choice(DEVICE_POOL)["ua"],
         "accept-encoding": "gzip",
-        "connection": "close",
+        "connection": "close",                 # fresh TCP -> new proxy exit IP
     }
     if force_sign:
-        headers.update(_sign(params, qs))
+        headers.update(signer.sign(qs, params))
 
-    r = requests.post(f"{host}{STATS_PATH}?{qs}", headers=headers,
-                      proxies=proxy, timeout=REQUEST_TIMEOUT)
+    try:
+        r = requests.post(f"{host}{STATS_PATH}?{qs}", headers=headers,
+                          proxies=proxy, timeout=REQUEST_TIMEOUT, verify=False)
+    except requests.exceptions.SSLError:
+        return "err", "SSLError"
+    except requests.exceptions.ProxyError:
+        return "err", "ProxyError"
+    except requests.exceptions.ConnectTimeout:
+        return "err", "ConnectTimeout"
+    except requests.exceptions.ReadTimeout:
+        return "err", "ReadTimeout"
+    except Exception as e:
+        return "err", type(e).__name__
 
     if r.status_code >= 400:
         return "hardblock", f"HTTP {r.status_code}"
@@ -215,23 +222,18 @@ def send_once(host: str, params: dict, proxy, force_sign: bool = True):
     except Exception:
         return "softblock", "non-json body"
     code = data.get("status_code")
-    if code == 0:
-        return "ok", None
-    return "softblock", f"status_code={code}"
+    return ("ok", None) if code == 0 else ("softblock", f"status_code={code}")
 
 
 # ---------------------------------------------------------------------------
 def test_hosts() -> None:
-    print("[*] host connectivity test:")
+    print("[*] host connectivity test (signed probe, direct):")
     for h in HOSTS:
         try:
-            r = requests.post(f"{h}{STATS_PATH}", headers={
-                "user-agent": DEVICE_POOL[0]["ua"],
-                "content-type": "application/x-www-form-urlencoded"
-            }, timeout=8)
-            print(f"    {h.split('/')[2]:<40} HTTP {r.status_code} body_len={len(r.content)}")
+            ok, note = health.probe(h)
+            print(f"    {h.split('//')[1]:<42} {'OK  ' if ok else 'FAIL'} {note}")
         except Exception as e:
-            print(f"    {h.split('/')[2]:<40} FAIL {type(e).__name__}")
+            print(f"    {h.split('//')[1]:<42} FAIL {type(e).__name__}")
 
 
 # ---------------------------------------------------------------------------
@@ -299,9 +301,9 @@ def worker(camp, shared, lock, pacer, pool, use_proxy, debug, hosts):
                     shared["shares"] += 1
             else:
                 shared[kind] = shared.get(kind, 0) + 1
-                if debug and shared["_dbg"] < 6:
+                if debug and shared["_dbg"] < 8:
                     shared["_dbg"] += 1
-                    print(f"    [dbg] {kind}: {detail} @ {host.split('//')[1][:26]}")
+                    print(f"    [dbg] {kind}: {detail} @ {host.split('//')[1]}")   # full host
             shared["sent"] += 1
 
 
@@ -310,7 +312,7 @@ def run_campaign(camp, state, pool, use_proxy, runtime_s, shape, rps_override,
     item_id = camp.item_id
     target = camp.target
     st = state["videos"].setdefault(item_id, {"ok": 0, "likes": 0, "shares": 0,
-                                               "target": target, "started": time.time()})
+                                              "target": target, "started": time.time()})
     st["target"] = target
     remaining = max(0, target - st["ok"])
 
@@ -323,7 +325,8 @@ def run_campaign(camp, state, pool, use_proxy, runtime_s, shape, rps_override,
     print(f"    item_id  : {item_id}")
     print(f"    cap      : {camp.cap_views:,} x{camp.overshoot:.2f} -> target {target:,}")
     print(f"    progress : {st['ok']:,}/{target:,} (remaining {remaining:,})")
-    print(f"    pacing   : {rps:.3f} req/s  shape={shape}  signer={'on' if HAVE_SIGNER else 'OFF'}")
+    print(f"    pacing   : {rps:.3f} req/s  shape={shape}  signer={'on' if signer.available else 'OFF'}")
+    print(f"    hosts    : {len(hosts)}  proxies: {len(pool) if pool else 0}")
 
     if remaining <= 0:
         print("    -> complete")
@@ -379,9 +382,9 @@ def run_campaign(camp, state, pool, use_proxy, runtime_s, shape, rps_override,
 
 
 # ---------------------------------------------------------------------------
-def bisect(item_id: str, pool: Optional[list[dict]]) -> int:
-    if not HAVE_SIGNER:
-        print("[!] SignerPy missing -> signing disabled. pip install SignerPy")
+def bisect(item_id: str, pool: Optional[list[dict]], hosts: list[str]) -> int:
+    if not signer.available:
+        print("[!] No signer available -> pip install SignerPy")
 
     targets = [("direct", None)]
     if pool:
@@ -390,7 +393,7 @@ def bisect(item_id: str, pool: Optional[list[dict]]) -> int:
 
     print("[*] bisect: path x host x signing")
     for label, proxy in targets:
-        for host in HOSTS[:4]:
+        for host in hosts[:4]:
             for use_sign in (True, False):
                 p = make_params(item_id, 0, 0)
                 try:
@@ -398,10 +401,43 @@ def bisect(item_id: str, pool: Optional[list[dict]]) -> int:
                 except Exception as e:
                     kind, detail = "err", type(e).__name__
                 tag = "sign" if use_sign else "raw "
-                print(f"    {label:6} {tag}  {host.split('//')[1][:34]:<36} -> {kind} {detail or ''}")
+                print(f"    {label:6} {tag}  {host.split('//')[1]:<36} -> {kind} {detail or ''}")
     return 0
 
 
+# ---------------------------------------------------------------------------
+def probe_pools(pool: list[dict], hosts: list[str]) -> tuple[list[str], list[dict]]:
+    """Return (live_hosts, live_proxies). Falls back to full host list on failure."""
+    print("[*] probing hosts for live endpoints...")
+    live = health.live_hosts(hosts, workers=8)
+    if live:
+        print(f"[*] {len(live)} live host(s): {', '.join(h.split('//')[1] for h in live[:5])}")
+        hosts = live
+    else:
+        print("[!] no live host found - using full host list")
+
+    if not pool:
+        return hosts, pool
+
+    print(f"[*] probing {len(pool)} proxies against {hosts[0].split('//')[1]} ...")
+    good = health.live_proxies(pool, hosts[0], workers=48)
+    print(f"[*] {len(good)}/{len(pool)} proxies return a real body")
+
+    if good:
+        try:
+            GOOD_PROXY_FILE.write_text("\n".join(
+                p["https"] for p in good if p) + "\n", encoding="utf-8")
+            print(f"[*] saved {len(good)} live proxies to {GOOD_PROXY_FILE.name}")
+        except Exception:
+            pass
+
+    if len(good) < 5:
+        print("[!] too few live proxies - adding direct fallback entries")
+        good = good + [None] * max(5, 10 - len(good))
+    return hosts, good
+
+
+# ---------------------------------------------------------------------------
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--campaign")
@@ -414,6 +450,7 @@ def main() -> int:
     ap.add_argument("--no-proxy", action="store_true")
     ap.add_argument("--residential-only", action="store_true")
     ap.add_argument("--ensure-proxies", action="store_true")
+    ap.add_argument("--no-probe", action="store_true", help="skip host/proxy probing")
     ap.add_argument("--bisect", action="store_true")
     ap.add_argument("--test-hosts", action="store_true")
     ap.add_argument("--dry", action="store_true")
@@ -433,7 +470,7 @@ def main() -> int:
         c.item_id = resolve_item_id(c.url or c.id)
     camps = [c for c in camps if c.item_id]
     if not camps:
-        print("[-] No resolvable campaigns")
+        print("[-] No resolvable campaigns (check url/id in campaigns.json)")
         return 1
 
     if args.reset and STATE_FILE.exists():
@@ -448,23 +485,29 @@ def main() -> int:
         for c in camps:
             c.window_hours = args.window
 
-    pool, use_proxy = None, not args.no_proxy
-    if use_proxy:
-        pool = load_proxy_pool(args.residential_only)
-        if pool:
-            print(f"[*] Loaded {len(pool)} proxies")
-        else:
-            use_proxy = False
+    # --- build pools ---
+    pool: list[dict] = load_proxy_pool(args.residential_only) if not args.no_proxy else []
+    hosts = HOSTS
+
+    # --- probe hosts + proxies (the fix) ---
+    if not args.no_probe:
+        hosts, pool = probe_pools(pool, hosts)
+
+    use_proxy = bool(pool)
+    if pool:
+        print(f"[*] using {len(pool)} pool entries ({sum(1 for p in pool if p)} proxied)")
+    else:
+        print("[*] direct mode (no proxies)")
 
     if args.bisect:
-        return bisect(camps[0].item_id, pool)
+        return bisect(camps[0].item_id, pool, hosts)
 
     state = load_state()
     runtime_s = args.runtime * 60 if args.runtime else None
     for camp in camps:
         run_campaign(camp, state, pool, use_proxy, runtime_s, args.shape,
                      args.rps or None, args.workers or None, args.duty, args.dry,
-                     args.debug, HOSTS)
+                     args.debug, hosts)
     print("\n[+] Done.")
     return 0
 

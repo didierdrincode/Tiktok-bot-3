@@ -17,7 +17,7 @@ concurrency:
 jobs:
   drip:
     runs-on: ubuntu-latest
-    timeout-minutes: 360 # Allows running up to the maximum 6-hour GitHub Actions job limit
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -35,22 +35,13 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      - name: Ensure proxies & run continuous bot loop
+      - name: Continuous loop
         run: |
-          # Set runtime variable from input or default
           RUNTIME="${{ github.event.inputs.runtime || 15 }}"
-          
-          # Infinite loop within the 6-hour job window to keep harvesting and running
           while true; do
-            echo "[*] Starting proxy assurance cycle..."
-            python ensure_proxies.py --min 50 --max-wait 10
-            
-            echo "[*] Running host diagnostics..."
-            python tiktok_bot.py --test-hosts || true
-            
-            echo "[*] Executing view generation slice for ${RUNTIME} minutes..."
+            echo "[*] assuring proxies..."
+            python ensure_proxies.py --min 50 --max-wait 10 || true
+            echo "[*] running slice (${RUNTIME}m) - probing hosts+proxies inside..."
             python tiktok_bot.py --runtime "$RUNTIME" --residential-only --debug || true
-            
-            echo "[*] Slice finished. Looping back to harvest fresh proxies and continue..."
             sleep 5
           done

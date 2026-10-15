@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Full local pipeline: harvest -> validate -> classify -> run bot.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 PY=python3
@@ -14,8 +13,8 @@ echo "[*] validating proxies..."
 "$PY" check_proxies.py -i free-proxy-list.txt -o working-proxies.txt -t 8 -w 64 || true
 "$PY" geo_resolve.py || true
 
-echo "[*] plan:"
-"$PY" plan.py
+echo "[*] host/proxy health:"
+"$PY" tiktok_bot.py --bisect || true
 
 echo "[*] running bot (Ctrl-C to stop)..."
 exec "$PY" tiktok_bot.py "$@"
