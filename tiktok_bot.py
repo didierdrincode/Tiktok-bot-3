@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """
-tiktok_bot.py  (v3.1)
-Signed TikTok engagement bot with restored argument support and error handling.
+tiktok_bot.py  (v3.2)
+Signed TikTok engagement bot optimized for GitHub Actions with proxy support and error handling.
 """
 from __future__ import annotations
 
-import argparse, json, math, random, re, threading, time
+import argparse
+import json
+import math
+import random
+import re
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -66,7 +72,15 @@ class Campaign:
 
 
 def load_campaigns(path: Path) -> list[Campaign]:
-    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not path.exists():
+        # Fallback default campaign if campaigns.json doesn't exist yet
+        return [Campaign(name="Default Campaign", cap_views=10000, url="", enabled=True)]
+    
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        raw = []
+        
     if isinstance(raw, dict):
         raw = raw.get("campaigns", [])
     out = []
@@ -113,15 +127,16 @@ def load_proxy_pool(residential_only: bool) -> list[dict]:
         except Exception:
             geo = {}
     pool = []
-    for line in load_lines(WORKING_PROXY):
-        cfg = parse_proxy(line)
-        if not cfg:
-            continue
-        if residential_only:
-            if geo.get(f"{cfg.scheme}://{cfg.host}:{cfg.port}", {}).get("is_datacenter", True):
+    if WORKING_PROXY.exists():
+        for line in load_lines(WORKING_PROXY):
+            cfg = parse_proxy(line)
+            if not cfg:
                 continue
-        u = build_proxy_url(cfg)
-        pool.append({"http": u, "https": u})
+            if residential_only:
+                if geo.get(f"{cfg.scheme}://{cfg.host}:{cfg.port}", {}).get("is_datacenter", True):
+                    continue
+            u = build_proxy_url(cfg)
+            pool.append({"http": u, "https": u})
     return pool
 
 
@@ -295,7 +310,7 @@ def run_campaign(camp, state, pool, use_proxy, runtime_s, shape, rps_override,
     item_id = camp.item_id
     target = camp.target
     st = state["videos"].setdefault(item_id, {"ok": 0, "likes": 0, "shares": 0,
-                                              "target": target, "started": time.time()})
+                                               "target": target, "started": time.time()})
     st["target"] = target
     remaining = max(0, target - st["ok"])
 
@@ -400,7 +415,7 @@ def main() -> int:
     ap.add_argument("--residential-only", action="store_true")
     ap.add_argument("--ensure-proxies", action="store_true")
     ap.add_argument("--bisect", action="store_true")
-    ap.add_argument("--test-hosts", action="store_true")  # Restored argument definition
+    ap.add_argument("--test-hosts", action="store_true")
     ap.add_argument("--dry", action="store_true")
     ap.add_argument("--reset", action="store_true")
     ap.add_argument("--debug", action="store_true")
