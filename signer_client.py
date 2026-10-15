@@ -1,67 +1,105 @@
 """
 signer_client.py
-In-process TikTok signer (SignerPy) with OPTIONAL external HTTP signer fallback.
-No localhost service required. Set SIGNER_URL env to use an external signer.
+In-process TikTok signer on top of `tiktok-signer` (iqbalmh18), with a STABLE
+DeviceProfile persisted to disk.
+
+Critical: TikTok binds X-Argus to a device. The device_id / openudid / cdid in the
+query string MUST be the same values the signer used. This module owns the device
+and exposes it, so the bot never invents its own.
 """
 from __future__ import annotations
 
-import os
-from typing import Optional
+import json
+import random
+from pathlib import Path
 
 try:
-    from SignerPy import sign as _sp_sign
+    from tiktok_signer import TikTokSigner, DeviceProfile
     HAVE_SIGNER = True
 except Exception:
     HAVE_SIGNER = False
 
-try:
-    import httpx
-    _HAVE_HTTP = True
-except Exception:
-    _HAVE_HTTP = False
+DEVICE_FILE = Path(__file__).resolve().parent / "device-profile.json"
+
+# App identity — MUST match the signer defaults so signatures verify.
+AID = 1233
+VERSION_NAME = "37.0.4"
+VERSION_CODE = 2023700040
+USER_AGENT = (
+    "com.zhiliaoapp.musically/2023700040 "
+    "(Linux; U; Android 9; in_ID; 2203121C; Build/PQ3A.190705.09121607;"
+    "tt-ok/3.12.13.4-tiktok)"
+)
 
 
-class TikTokSigner:
-    def __init__(self, signer_url: Optional[str] = None):
-        self.signer_url = signer_url or os.getenv("SIGNER_URL", "").strip()
-        self._client = None
-        self._mode = None
-        self.available = HAVE_SIGNER or bool(self.signer_url)
+class SignerClient:
+    def __init__(self) -> None:
+        self.available = HAVE_SIGNER
+        self.ua = USER_AGENT
+        self.device_id = ""
+        self.openudid = ""
+        self.cdid = ""
+        self.iid = ""
+        self.device_type = "2203121C"
+        self.device_brand = "Xiaomi"
+        self.os_version = "9"
+        self.os_api = "28"
+        self.channel = "googleplay"
+        if HAVE_SIGNER:
+            self._load_device()
 
-    def sign(self, qs: str, params: dict) -> dict:
-        """Return signing headers (x-gorgon/x-ladon/x-argus/x-khronos/x-ss-stub)."""
-        # 1) external HTTP signer if configured
-        if self.signer_url and _HAVE_HTTP:
+    def _load_device(self) -> None:
+        data: dict = {}
+        if DEVICE_FILE.exists():
             try:
-                if self._client is None:
-                    self._client = httpx.Client(timeout=5.0)
-                r = self._client.post(self.signer_url, json={"url": qs, "params": params})
-                if r.status_code == 200:
-                    data = r.json()
-                    out = data.get("signed_params") or data.get("headers") or {}
-                    out = {k: v for k, v in out.items() if isinstance(v, str)}
-                    if out:
-                        return out
+                data = json.loads(DEVICE_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+
+        if not data:
+            data = {
+                "device_id": str(random.randint(10**18, 10**19 - 1)),
+                "iid": str(random.randint(7 * 10**18, 8 * 10**18)),
+                "device_type": self.device_type,
+                "device_brand": self.device_brand,
+                "os_version": self.os_version,
+                "os_api": self.os_api,
+                "channel": self.channel,
+            }
+            try:
+                DEVICE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
             except Exception:
                 pass
 
-        # 2) in-process SignerPy (default)
-        if HAVE_SIGNER:
-            for mode, arg in (("str", qs), ("dict", params)):
-                if self._mode and mode != self._mode:
-                    continue
-                try:
-                    sig = _sp_sign(params=arg, payload=None, version=8404)
-                    self._mode = mode
-                    return {k: v for k, v in sig.items() if isinstance(v, str)}
-                except Exception:
-                    continue
-        return {}
+        profile = DeviceProfile(
+            device_id=data["device_id"],
+            device_type=data.get("device_type", self.device_type),
+            os_version=data.get("os_version", self.os_version),
+            channel=data.get("channel", self.channel),
+        )
+        TikTokSigner.set_device(profile)          # ONE stable device for the session
 
-    def close(self):
-        if self._client:
-            self._client.close()
+        self.device_id = data["device_id"]
+        self.iid = data["iid"]
+        self.device_type = data.get("device_type", self.device_type)
+        self.device_brand = data.get("device_brand", self.device_brand)
+        self.os_version = data.get("os_version", self.os_version)
+        self.os_api = data.get("os_api", self.os_api)
+        self.channel = data.get("channel", self.channel)
+        self.openudid = getattr(profile, "openudid", "") or ""
+        self.cdid = getattr(profile, "cdid", "") or ""
+
+    def sign(self, qs: str, params: dict, data=None) -> dict:
+        if not HAVE_SIGNER:
+            return {}
+        try:
+            h = TikTokSigner.generate_headers(
+                params=qs, data=data, aid=AID,
+                version_name=VERSION_NAME, version_code=VERSION_CODE,
+            )
+            return {k: v for k, v in h.items() if isinstance(v, str)}
+        except Exception:
+            return {}
 
 
-# module-level singleton used by the bot
-signer = TikTokSigner()
+signer = SignerClient()

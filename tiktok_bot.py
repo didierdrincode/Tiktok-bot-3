@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-tiktok_bot.py  (v4.0)
+tiktok_bot.py  (v5.0)
 Signed TikTok engagement bot for GitHub Actions.
 
-v4.0 changes over v3.2:
-  * Host PROBE at startup - only live endpoints (non-empty body) are used.
-  * Proxy PROBE at startup - only proxies that actually answer TikTok are used.
-    Falls back to direct entries when the live pool is too small.
-  * Signing delegated to signer_client (in-process SignerPy, no localhost service).
-  * send_once handles SSLError / ProxyError explicitly and uses verify=False
-    (free proxies frequently present bad certs).
-  * Debug prints full hostnames (no truncation).
-  * Live proxy subset saved to good-proxies.txt for inspection.
+v5.0 changes:
+  * HTTP via curl_cffi with Chrome TLS impersonation (requests' OpenSSL JA3 is
+    refused by TikTok's edge -> the 403 storm).
+  * Signing via signer_client / tiktok-signer with a STABLE DeviceProfile.
+    device_id / openudid / cdid come from the signer so X-Argus verifies.
+  * App identity coherent with the signer defaults (aid=1233, app 37.0.4).
+  * Host list curated to tiktokv.com only (musical.ly legacy hosts 403).
+  * Host + proxy probing before the run; direct fallback when pool is thin.
+  * --new-device rotates the device fingerprint.
 """
 from __future__ import annotations
 
@@ -27,12 +27,23 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlencode
 
-import requests
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-import health                                   # NEW: host/proxy probing
-from signer_client import signer                # NEW: in-process signer
+# --- HTTP client: curl_cffi preferred (TLS impersonation), requests fallback ---
+try:
+    from curl_cffi import requests as hc
+    _HAVE_CFFI = True
+except Exception:
+    import requests as hc
+    _HAVE_CFFI = False
+
+import health                                                   # host/proxy probing
+from signer_client import (                                     # signer + device
+    signer, AID, VERSION_CODE, VERSION_NAME, DEVICE_FILE,
+)
+
+import requests  # noqa: F401  (used by resolve_item_id)
 
 from config import (
     CAMPAIGNS_FILE, STATE_FILE, WORKING_PROXY, GEO_FILE,
@@ -41,20 +52,16 @@ from config import (
 )
 from check_proxies import load_lines, parse_proxy
 
-# --- candidate hosts -------------------------------------------------------
-try:
-    from SignerPy.hosts import host as sp_hosts
-    HOSTS = [f"https://{h}" for h in sp_hosts()]
-except Exception:
-    HOSTS = [
-        "https://api16-normal-c-useast1a.tiktokv.com",
-        "https://api22-normal-c-useast2a.tiktokv.com",
-        "https://api19-core-useast5.us.tiktokv.com",
-        "https://api16-normal-c-alisg.tiktokv.com",
-        "https://api16-normal-no1a.tiktokv.eu",
-        "https://api21-normal.tiktokv.com",
-        "https://api16-normal-c-useast2a.tiktokv.com",
-    ]
+# --- curated hosts: tiktokv.com only --------------------------------------
+HOSTS = [
+    "https://api.tiktokv.com",
+    "https://api16-normal-c-useast1a.tiktokv.com",
+    "https://api16-normal-c-alisg.tiktokv.com",
+    "https://api22-normal-c-useast2a.tiktokv.com",
+    "https://api19-core-useast5.us.tiktokv.com",
+    "https://api16-normal-no1a.tiktokv.eu",
+    "https://api21-normal.tiktokv.com",
+]
 
 STATS_PATH = "/aweme/v1/aweme/stats/"
 MIN_BODY = 4
@@ -119,10 +126,6 @@ def rand_hex(n: int) -> str:
     return "".join(random.choice("0123456789abcdef") for _ in range(n))
 
 
-def rand_iid() -> int:
-    return random.randint(7000000000000000000, 7999999999999999999)
-
-
 def build_proxy_url(cfg) -> str:
     auth = f"{cfg.username}:{cfg.password or ''}@" if cfg.username else ""
     s = {"socks4": "socks4a", "socks5": "socks5h", "https": "http"}.get(cfg.scheme, cfg.scheme)
@@ -159,7 +162,7 @@ def resolve_item_id(raw: str) -> Optional[str]:
         return m.group(1)
     try:
         r = requests.head(raw, allow_redirects=True, timeout=10,
-                          headers={"User-Agent": DEVICE_POOL[0]["ua"]})
+                          headers={"User-Agent": signer.ua})
         m = re.search(r"/video/(\d{15,20})", r.url) or re.search(r"(\d{18,19})", r.url)
         if m:
             return m.group(1)
@@ -169,15 +172,21 @@ def resolve_item_id(raw: str) -> Optional[str]:
 
 
 def make_params(item_id: str, like_rate: float, share_rate: float) -> dict:
-    dev = random.choice(DEVICE_POOL)
+    """Params use the SIGNER'S device so X-Argus verifies."""
     return {
-        "aid": 1988, "channel": "googleplay",
-        "device_type": dev["device_type"], "device_brand": dev["device_brand"],
-        "device_id": rand_device_id(),
-        "os_version": dev["os_version"], "os_api": dev["os_api"],
-        "version_code": 250103, "app_name": "musical_ly",
+        "aid": AID,
+        "app_name": "musical_ly",
+        "channel": signer.channel or "googleplay",
         "device_platform": "android",
-        "openudid": rand_hex(16), "iid": rand_iid(),
+        "device_type": signer.device_type or "2203121C",
+        "device_brand": signer.device_brand or "Xiaomi",
+        "device_id": signer.device_id or rand_device_id(),
+        "openudid": signer.openudid or rand_hex(16),
+        "iid": signer.iid or str(random.randint(7 * 10**18, 8 * 10**18)),
+        "os_version": signer.os_version or "9",
+        "os_api": signer.os_api or "28",
+        "version_code": VERSION_CODE,
+        "version_name": VERSION_NAME,
         "item_id": item_id,
         "play_delta": 1,
         "digg_delta": 1 if random.random() < like_rate else 0,
@@ -186,29 +195,27 @@ def make_params(item_id: str, like_rate: float, share_rate: float) -> dict:
 
 
 # ---------------------------------------------------------------------------
+def _http_post(url: str, headers: dict, proxy):
+    if _HAVE_CFFI:
+        return hc.post(url, headers=headers, proxies=proxy, timeout=REQUEST_TIMEOUT,
+                       impersonate="chrome", verify=False)
+    return hc.post(url, headers=headers, proxies=proxy,
+                   timeout=REQUEST_TIMEOUT, verify=False)
+
+
 def send_once(host: str, params: dict, proxy, force_sign: bool = True):
     """Returns (kind, detail). kind in {ok, softblock, hardblock, err}."""
     qs = urlencode(params)
     headers = {
-        "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-        "user-agent": random.choice(DEVICE_POOL)["ua"],
+        "user-agent": signer.ua,
         "accept-encoding": "gzip",
-        "connection": "close",                 # fresh TCP -> new proxy exit IP
+        "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
     }
     if force_sign:
         headers.update(signer.sign(qs, params))
 
     try:
-        r = requests.post(f"{host}{STATS_PATH}?{qs}", headers=headers,
-                          proxies=proxy, timeout=REQUEST_TIMEOUT, verify=False)
-    except requests.exceptions.SSLError:
-        return "err", "SSLError"
-    except requests.exceptions.ProxyError:
-        return "err", "ProxyError"
-    except requests.exceptions.ConnectTimeout:
-        return "err", "ConnectTimeout"
-    except requests.exceptions.ReadTimeout:
-        return "err", "ReadTimeout"
+        r = _http_post(f"{host}{STATS_PATH}?{qs}", headers, proxy)
     except Exception as e:
         return "err", type(e).__name__
 
@@ -303,7 +310,7 @@ def worker(camp, shared, lock, pacer, pool, use_proxy, debug, hosts):
                 shared[kind] = shared.get(kind, 0) + 1
                 if debug and shared["_dbg"] < 8:
                     shared["_dbg"] += 1
-                    print(f"    [dbg] {kind}: {detail} @ {host.split('//')[1]}")   # full host
+                    print(f"    [dbg] {kind}: {detail} @ {host.split('//')[1]}")
             shared["sent"] += 1
 
 
@@ -325,7 +332,8 @@ def run_campaign(camp, state, pool, use_proxy, runtime_s, shape, rps_override,
     print(f"    item_id  : {item_id}")
     print(f"    cap      : {camp.cap_views:,} x{camp.overshoot:.2f} -> target {target:,}")
     print(f"    progress : {st['ok']:,}/{target:,} (remaining {remaining:,})")
-    print(f"    pacing   : {rps:.3f} req/s  shape={shape}  signer={'on' if signer.available else 'OFF'}")
+    print(f"    pacing   : {rps:.3f} req/s  shape={shape}  "
+          f"signer={'on' if signer.available else 'OFF'}  http={'cffi' if _HAVE_CFFI else 'requests'}")
     print(f"    hosts    : {len(hosts)}  proxies: {len(pool) if pool else 0}")
 
     if remaining <= 0:
@@ -384,7 +392,9 @@ def run_campaign(camp, state, pool, use_proxy, runtime_s, shape, rps_override,
 # ---------------------------------------------------------------------------
 def bisect(item_id: str, pool: Optional[list[dict]], hosts: list[str]) -> int:
     if not signer.available:
-        print("[!] No signer available -> pip install SignerPy")
+        print("[!] No signer -> pip install tiktok-signer")
+    if not _HAVE_CFFI:
+        print("[!] curl_cffi missing -> pip install curl_cffi (TLS impersonation off)")
 
     targets = [("direct", None)]
     if pool:
@@ -407,7 +417,7 @@ def bisect(item_id: str, pool: Optional[list[dict]], hosts: list[str]) -> int:
 
 # ---------------------------------------------------------------------------
 def probe_pools(pool: list[dict], hosts: list[str]) -> tuple[list[str], list[dict]]:
-    """Return (live_hosts, live_proxies). Falls back to full host list on failure."""
+    """Return (live_hosts, live_pool). Falls back to full host list on failure."""
     print("[*] probing hosts for live endpoints...")
     live = health.live_hosts(hosts, workers=8)
     if live:
@@ -425,8 +435,8 @@ def probe_pools(pool: list[dict], hosts: list[str]) -> tuple[list[str], list[dic
 
     if good:
         try:
-            GOOD_PROXY_FILE.write_text("\n".join(
-                p["https"] for p in good if p) + "\n", encoding="utf-8")
+            GOOD_PROXY_FILE.write_text(
+                "\n".join(p["https"] for p in good if p) + "\n", encoding="utf-8")
             print(f"[*] saved {len(good)} live proxies to {GOOD_PROXY_FILE.name}")
         except Exception:
             pass
@@ -439,6 +449,8 @@ def probe_pools(pool: list[dict], hosts: list[str]) -> tuple[list[str], list[dic
 
 # ---------------------------------------------------------------------------
 def main() -> int:
+    global signer, health
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--campaign")
     ap.add_argument("--runtime", type=float, default=0)
@@ -451,12 +463,21 @@ def main() -> int:
     ap.add_argument("--residential-only", action="store_true")
     ap.add_argument("--ensure-proxies", action="store_true")
     ap.add_argument("--no-probe", action="store_true", help="skip host/proxy probing")
+    ap.add_argument("--new-device", action="store_true", help="rotate device fingerprint")
     ap.add_argument("--bisect", action="store_true")
     ap.add_argument("--test-hosts", action="store_true")
     ap.add_argument("--dry", action="store_true")
     ap.add_argument("--reset", action="store_true")
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
+
+    if args.new_device and DEVICE_FILE.exists():
+        DEVICE_FILE.unlink()
+        import importlib
+        import signer_client
+        importlib.reload(signer_client)
+        signer = signer_client.signer
+        print("[*] rotated device fingerprint")
 
     if args.test_hosts:
         test_hosts()
@@ -489,7 +510,7 @@ def main() -> int:
     pool: list[dict] = load_proxy_pool(args.residential_only) if not args.no_proxy else []
     hosts = HOSTS
 
-    # --- probe hosts + proxies (the fix) ---
+    # --- probe hosts + proxies ---
     if not args.no_probe:
         hosts, pool = probe_pools(pool, hosts)
 
