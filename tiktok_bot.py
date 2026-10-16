@@ -171,8 +171,31 @@ def resolve_item_id(raw: str) -> Optional[str]:
     return None
 
 
+# def make_params(item_id: str, like_rate: float, share_rate: float) -> dict:
+#     """Params use the SIGNER'S device so X-Argus verifies."""
+#     return {
+#         "aid": AID,
+#         "app_name": "musical_ly",
+#         "channel": signer.channel or "googleplay",
+#         "device_platform": "android",
+#         "device_type": signer.device_type or "2203121C",
+#         "device_brand": signer.device_brand or "Xiaomi",
+#         "device_id": signer.device_id or rand_device_id(),
+#         "openudid": signer.openudid or rand_hex(16),
+#         "iid": signer.iid or str(random.randint(7 * 10**18, 8 * 10**18)),
+#         "os_version": signer.os_version or "9",
+#         "os_api": signer.os_api or "28",
+#         "version_code": VERSION_CODE,
+#         "version_name": VERSION_NAME,
+#         "item_id": item_id,
+#         "play_delta": 1,
+#         "digg_delta": 1 if random.random() < like_rate else 0,
+#         "share_delta": 1 if random.random() < share_rate else 0,
+#     }
+
+
 def make_params(item_id: str, like_rate: float, share_rate: float) -> dict:
-    """Params use the SIGNER'S device so X-Argus verifies."""
+    """Fresh device_id per request so each one is a UNIQUE viewer."""
     return {
         "aid": AID,
         "app_name": "musical_ly",
@@ -180,9 +203,9 @@ def make_params(item_id: str, like_rate: float, share_rate: float) -> dict:
         "device_platform": "android",
         "device_type": signer.device_type or "2203121C",
         "device_brand": signer.device_brand or "Xiaomi",
-        "device_id": signer.device_id or rand_device_id(),
-        "openudid": signer.openudid or rand_hex(16),
-        "iid": signer.iid or str(random.randint(7 * 10**18, 8 * 10**18)),
+        "device_id": str(random.randint(10**18, 10**19 - 1)),   # ← ROTATE
+        "openudid": rand_hex(16),                               # ← ROTATE
+        "iid": str(random.randint(7 * 10**18, 8 * 10**18)),      # ← ROTATE
         "os_version": signer.os_version or "9",
         "os_api": signer.os_api or "28",
         "version_code": VERSION_CODE,
@@ -212,7 +235,9 @@ def send_once(host: str, params: dict, proxy, force_sign: bool = True):
         "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
     }
     if force_sign:
-        headers.update(signer.sign(qs, params))
+        headers.update(signer.sign(qs, params, device_id=params["device_id"]))
+    # if force_sign:
+    #     headers.update(signer.sign(qs, params))
 
     try:
         r = _http_post(f"{host}{STATS_PATH}?{qs}", headers, proxy)
@@ -369,7 +394,10 @@ def run_campaign(camp, state, pool, use_proxy, runtime_s, shape, rps_override,
             if time.time() - last > 10:
                 with lock:
                     st["ok"] += shared["views"] - st.get("_flushed", 0)
-                st["_flushed"] = shared["views"]
+                    st["likes"] += shared["likes"]
+                    st["shares"] += shared["shares"]
+                st.pop("_flushed", None)
+                # st["_flushed"] = shared["views"]
                 save_state(state)
                 last = time.time()
     except KeyboardInterrupt:

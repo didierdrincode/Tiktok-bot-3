@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import random
 from pathlib import Path
+from typing import Optional
 
 try:
     from tiktok_signer import TikTokSigner, DeviceProfile
@@ -89,12 +90,13 @@ class SignerClient:
         self.openudid = getattr(profile, "openudid", "") or ""
         self.cdid = getattr(profile, "cdid", "") or ""
 
-    def sign(self, qs: str, params: dict, data=None) -> dict:
+    def sign(self, qs: str, params: dict, data=None, device_id: Optional[str] = None) -> dict:
         if not HAVE_SIGNER:
             return {}
         try:
             h = TikTokSigner.generate_headers(
                 params=qs, data=data, aid=AID,
+                device_id=device_id or None,          # ← per-request device
                 version_name=VERSION_NAME, version_code=VERSION_CODE,
             )
             return {k: v for k, v in h.items() if isinstance(v, str)}
