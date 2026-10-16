@@ -10,6 +10,9 @@ on:
       runtime:
         default: "15"
 
+env:
+  RESET_STATE: "yes"        # flip to "no" after the first clean run
+
 concurrency:
   group: tiktok-drip
   cancel-in-progress: false
@@ -20,28 +23,52 @@ jobs:
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
 
-      - uses: actions/cache@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Restore state, counts and proxies
+        uses: actions/cache@v4
         with:
           path: |
             state.json
+            viewcounts.json
+            viewcounts.log
             free-proxy-list.txt
             working-proxies.txt
             proxy-geo.json
           key: botdata-${{ github.run_id }}
           restore-keys: botdata-
 
-      - run: pip install -r requirements.txt
+      - name: Install deps
+        run: pip install -r requirements.txt
 
+      # --- one-off: clear the poisoned state -------------------------------
+      - name: Reset state
+        if: env.RESET_STATE == 'yes'
+        run: python tiktok_bot.py --reset-only
+
+      # --- baseline view counts -------------------------------------------
+      - name: Baseline view counts
+        run: python verify.py --all || true
+
+      # --- continuous loop -------------------------------------------------
       - name: Continuous loop
         run: |
           RUNTIME="${{ github.event.inputs.runtime || 15 }}"
           while true; do
+            echo "================ BEFORE SLICE ================"
+            python verify.py --all || true
+
             echo "[*] assuring proxies..."
             python ensure_proxies.py --min 50 --max-wait 10 || true
-            echo "[*] running slice (${RUNTIME}m) - probing hosts+proxies inside..."
+
+            echo "[*] running slice (${RUNTIME}m)..."
             python tiktok_bot.py --runtime "$RUNTIME" --residential-only --debug || true
+
+            echo "================ AFTER SLICE ================"
+            python verify.py --all || true
+
             sleep 5
           done

@@ -338,6 +338,14 @@ def worker(camp, shared, lock, pacer, pool, use_proxy, debug, hosts):
                     print(f"    [dbg] {kind}: {detail} @ {host.split('//')[1]}")
             shared["sent"] += 1
 
+def _flush(st: dict, shared: dict) -> None:
+    """Add only the DELTA since the last flush."""
+    st["ok"]     += shared["views"]  - st.get("_fv", 0)
+    st["likes"]  += shared["likes"]  - st.get("_fl", 0)
+    st["shares"] += shared["shares"] - st.get("_fs", 0)
+    st["_fv"] = shared["views"]
+    st["_fl"] = shared["likes"]
+    st["_fs"] = shared["shares"]
 
 def run_campaign(camp, state, pool, use_proxy, runtime_s, shape, rps_override,
                  workers_override, duty, dry, debug, hosts):
@@ -393,11 +401,7 @@ def run_campaign(camp, state, pool, use_proxy, runtime_s, shape, rps_override,
                 break
             if time.time() - last > 10:
                 with lock:
-                    st["ok"] += shared["views"] - st.get("_flushed", 0)
-                    st["likes"] += shared["likes"]
-                    st["shares"] += shared["shares"]
-                st.pop("_flushed", None)
-                # st["_flushed"] = shared["views"]
+                    _flush(st, shared)
                 save_state(state)
                 last = time.time()
     except KeyboardInterrupt:
@@ -407,10 +411,9 @@ def run_campaign(camp, state, pool, use_proxy, runtime_s, shape, rps_override,
         for t in threads:
             t.join(timeout=15)
         with lock:
-            st["ok"] += shared["views"]
-            st["likes"] += shared["likes"]
-            st["shares"] += shared["shares"]
-        st.pop("_flushed", None)
+            _flush(st, shared)
+        for k in ("_fv", "_fl", "_fs", "_flushed"):
+            st.pop(k, None)
         save_state(state)
         print(f"    [+] run: +{shared['views']:,} views (soft {shared['softblock']} "
               f"hard {shared['hardblock']} err {shared['err']})")
@@ -496,6 +499,8 @@ def main() -> int:
     ap.add_argument("--test-hosts", action="store_true")
     ap.add_argument("--dry", action="store_true")
     ap.add_argument("--reset", action="store_true")
+    ap.add_argument("--reset-only", action="store_true",
+                    help="clear state.json and exit (no slice)")
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
 
@@ -522,8 +527,16 @@ def main() -> int:
         print("[-] No resolvable campaigns (check url/id in campaigns.json)")
         return 1
 
-    if args.reset and STATE_FILE.exists():
-        STATE_FILE.unlink()
+    # if args.reset and STATE_FILE.exists():
+    #     STATE_FILE.unlink()
+    if args.reset or args.reset_only:
+        if STATE_FILE.exists():
+            STATE_FILE.unlink()
+            print("[*] state.json cleared")
+        else:
+            print("[*] state.json already absent")
+    if args.reset_only:
+        return 0
     if args.ensure_proxies and not args.no_proxy:
         try:
             import ensure_proxies
